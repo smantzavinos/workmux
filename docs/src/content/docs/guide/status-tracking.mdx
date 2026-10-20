@@ -87,20 +87,61 @@ Restart pi for the extension to take effect.
 
 ### Pi subagents
 
+Workmux can keep the parent's sidebar/dashboard entry working while delegated
+work remains active. Children are aggregated into the parent entry, not shown as
+separate rows. Aborted parent turns remain working for continuation, including
+during compaction; a later successful continuation can report done.
+
+#### pi-subagents
+
+With [pi-subagents](https://github.com/nicobailon/pi-subagents) installed, workmux
+uses its public event-bus RPC (`subagents:rpc:v1`) and the version 1 fleet status
+API. No pi-subagents configuration changes or runtime package imports are needed.
+Older versions without this API retain ordinary Pi status behavior.
+
+Workmux probes the current session's `fleet.totalActive` on startup and listens
+for readiness and async start/completion notices. Automatic discovery stops after
+three attempts if no compatible API replies; a later readiness notice can restart
+it. Once a compatible reply arrives, workmux refreshes at parent settlement and
+every three seconds. While that count is positive, the parent stays working even
+after its own turn ends.
+Each positive polling response also refreshes the pane's activity, preventing
+quiet background work from being mistaken for an interrupted parent. These
+heartbeats preserve the elapsed working timer. When the count reaches zero and
+the parent is inactive, workmux reports done.
+
+RPC requests time out after two seconds. Parent settlement also has a two-second
+overall refresh budget, even if child activity repeatedly supersedes replies.
+If that budget expires or the refresh fails, workmux conservatively keeps working
+until a fresh snapshot resolves the uncertainty. Missing, failed, or incompatible
+replies do not mark work complete or heartbeat the last known count. A later valid
+response restores tracking. These RPC deadlines do not change workmux command
+timeouts. Heartbeats coalesce behind slow status commands instead of building an
+unbounded write queue. Polling stops on session shutdown and restarts with
+fresh state on reload or session replacement. Background Pi children marked with
+`PI_SUBAGENT_CHILD=1` do not register or publish their own pane status.
+
+Tracking follows the current-session activity exposed by the fleet API, including
+its total beyond the displayed entry limit. It does not promise complete tracking
+of nested descendants that outlive their tracked parent, or of detached work
+after the parent Pi process exits. Workmux does not inspect child files, scrape
+terminal output for subagent status, or poll child processes. RPC requests run
+between extensions without model calls.
+
+#### pi-suba
+
 With a [pi-suba](https://github.com/raine/pi-suba) release that publishes activity
 snapshots, the parent stays working while either the parent or any delegated child
 is active. Waiting children do not count as active. When both the parent and all
-children are inactive, workmux reports done. Resuming a child marks the parent
-working again, even without a new parent turn.
+children are inactive, workmux reports done, subject to the aborted-continuation
+behavior above. Resuming a child marks the parent working again, even without a
+new parent turn.
 
 The extensions communicate through `pi.events`: pi-suba publishes
 `suba:activity` with `{ activeCount: number }`, and workmux requests an initial
-snapshot with `suba:activity:request`. Workmux does not read child session files or
-poll child processes.
-
-Without an activity publisher, Pi status behavior is unchanged, including keeping
-aborted turns working for continuation. With a publisher, a settled aborted parent
-is inactive, but active children still keep it working.
+snapshot with `suba:activity:request`. If both subagent extensions are installed,
+neither one's idle snapshot clears the other's active work. Without a compatible
+subagent extension, Pi status behavior is unchanged.
 
 ## Oh My Pi setup
 

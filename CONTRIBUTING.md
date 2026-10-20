@@ -55,6 +55,38 @@ just itest tests/test_workmux_add/test_basic.py
 just itest tests/test_agent_state.py -vvv
 ```
 
+### Pi subagent status smoke test (opt-in)
+
+The Pi status unit tests run with `bun test tests/pi_status_extension.test.ts`.
+For the real extension/RPC/process/sidebar boundary, an optional smoke helper uses
+Pi, a locally installed pi-subagents extension with fleet status v1, and tmux:
+
+```bash
+cargo build
+python3 tests/pi_subagents_smoke.py \
+  --pi-subagents /path/to/pi-subagents/index.js
+```
+
+The helper defaults to `target/debug/workmux` and finds `pi` and `tmux` on PATH.
+Use `--workmux`, `--pi`, or `--tmux` to select other binaries. It takes about
+30 seconds and is deliberately excluded from the ordinary pytest suite.
+
+It creates a private tmux server and temporary HOME, Pi configuration, and XDG
+state. The only model endpoint is a deterministic loopback fixture; no real
+credentials, paid model calls, package installation, or existing sessions are
+used. Three native children complete, fail, and stop while the parent settles.
+The helper checks actual sidebar snapshots beyond the inactivity timeout,
+heartbeat timestamps, preserved elapsed time, final completion, and child status
+suppression. The command logger forwards to the real workmux binary; it never
+supplies fake status results.
+
+Failures retain logs and snapshots and print their directory. Pass
+`--keep-artifacts` to retain successful runs too. Cleanup asks Pi to stop only the
+runs created by the helper, shuts down Pi, and removes the private tmux server and
+its sidebar daemon.
+If the platform's temporary directory is too long for Unix sockets, set a shorter
+`TMPDIR` before running.
+
 ### Testing different backends
 
 By default, tests run against **tmux only**.

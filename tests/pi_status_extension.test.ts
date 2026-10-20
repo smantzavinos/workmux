@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
 
 type Spawned = { args: string[]; cwd: string; prompt: string };
@@ -25,7 +25,25 @@ mock.module('node:child_process', () => ({
   },
 }));
 
+// Drive real lifecycle intervals and RPC deadlines without wall-clock sleeps.
+type Timer = { callback: () => void; at: number; repeat?: number; unref(): void };
+const timers = new Set<Timer>();
+let clock = 0;
+function schedule(callback: () => void, delay: number, repeat?: number) {
+  const timer: Timer = { callback, at: clock + delay, repeat, unref() {} };
+  timers.add(timer);
+  return timer;
+}
+mock.module('node:timers', () => ({
+  setInterval: (callback: () => void, delay: number) => schedule(callback, delay, delay),
+  clearInterval: (timer: Timer) => timers.delete(timer),
+  setTimeout: (callback: () => void, delay: number) => schedule(callback, delay),
+  clearTimeout: (timer: Timer) => timers.delete(timer),
+}));
+afterEach(() => { timers.clear(); clock = 0; });
+
 const { default: workmuxStatusExtension } = await import('../resources/pi/extensions/workmux-status');
+type RpcRequest = { version: number; requestId: string; method: string };
 
 type Handler = (event: unknown, context: unknown) => Promise<void> | void;
 type Listener = (data: unknown) => Promise<void> | void;
@@ -49,6 +67,9 @@ async function createHarness(
   initialMessage = stoppedMessage(),
   options: {
     snapshot?: number;
+    subagents?: number;
+    child?: boolean;
+    disabled?: boolean;
     idle?: boolean;
     exec?: (args: string[]) => Promise<number>;
   } = {},
@@ -86,6 +107,23 @@ async function createHarness(
       events.emit('suba:activity', { activeCount: options.snapshot });
     });
   }
+  const requests: RpcRequest[] = [];
+  let subagents = options.subagents;
+  let replyEnabled = true;
+  const reply = (request: RpcRequest, payload: unknown) => {
+    events.emit(`subagents:rpc:v1:reply:${request.requestId}`, payload);
+  };
+  const statusReply = (request: RpcRequest, count: unknown) => ({
+    version: 1, requestId: request.requestId, method: 'status', success: true,
+    data: { fleet: { version: 1, totalActive: count, entries: [], omitted: count } },
+  });
+  events.on('subagents:rpc:v1:request', (data) => {
+    const request = data as RpcRequest;
+    requests.push(request);
+    if (subagents !== undefined && replyEnabled && request.version === 1 && request.method === 'status') {
+      reply(request, statusReply(request, subagents));
+    }
+  });
   const pi = {
     events,
     exec: async (_command: string, args: string[]) => {
@@ -96,11 +134,28 @@ async function createHarness(
     },
     on: (name: string, handler: Handler) => handlers.set(name, handler),
   };
-  workmuxStatusExtension(pi as never);
+  const originalChild = process.env.PI_SUBAGENT_CHILD;
+  const originalDisabled = process.env.WORKMUX_DISABLE_SET_WINDOW_STATUS;
+  try {
+    if (options.child) process.env.PI_SUBAGENT_CHILD = '1';
+    if (options.disabled) process.env.WORKMUX_DISABLE_SET_WINDOW_STATUS = '';
+    workmuxStatusExtension(pi as never);
+  } finally {
+    if (originalChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+    else process.env.PI_SUBAGENT_CHILD = originalChild;
+    if (originalDisabled === undefined) delete process.env.WORKMUX_DISABLE_SET_WINDOW_STATUS;
+    else process.env.WORKMUX_DISABLE_SET_WINDOW_STATUS = originalDisabled;
+  }
 
   const harness = {
     calls,
     statuses,
+    requests,
+    reply,
+    statusReply,
+    setSubagents(count: number) { subagents = count; },
+    pauseReplies() { replyEnabled = false; },
+    resumeReplies() { replyEnabled = true; },
     events,
     listeners,
     stopPublisher() { stopPublisher?.(); },
@@ -110,6 +165,20 @@ async function createHarness(
     async activity(activeCount: number) {
       events.emit('suba:activity', { activeCount });
       await this.flush();
+    },
+    async tick(milliseconds: number, drain = true) {
+      const end = clock + milliseconds;
+      while (true) {
+        const timer = [...timers].filter((timer) => timer.at <= end).sort((a, b) => a.at - b.at)[0];
+        if (!timer) break;
+        clock = timer.at;
+        if (timer.repeat) timer.at += timer.repeat;
+        else timers.delete(timer);
+        timer.callback();
+        if (drain) await this.flush();
+      }
+      clock = end;
+      if (drain) await this.flush();
     },
     setMessage(message: AssistantMessage) {
       branch = [...branch, { type: 'message', message }];
@@ -128,6 +197,7 @@ async function createHarness(
     },
   };
   await harness.emit('session_start');
+  await harness.flush();
   return harness;
 }
 
@@ -136,6 +206,293 @@ function deferred() {
   const promise = new Promise<void>((done) => { resolve = done; });
   return { promise, resolve };
 }
+
+describe('pi-subagents workmux integration', () => {
+  test.each([0, 2, 200])('restores current-session fleet activity, including omitted entries (%i)', async (count) => {
+    const harness = await createHarness(stoppedMessage(), { subagents: count });
+    expect(harness.statuses.at(-1)).toBe(count > 0 ? 'working' : 'done');
+  });
+
+  test('keeps a settled parent working until all async work finishes', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 2 });
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+    harness.setSubagents(1);
+    await harness.tick(3_000);
+    expect(harness.statuses).not.toContain('done');
+    harness.setSubagents(0);
+    await harness.tick(3_000);
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test('keeps a busy parent working after the final child finishes', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    await harness.emit('agent_start');
+    harness.setSubagents(0);
+    await harness.tick(3_000);
+    expect(harness.statuses).not.toContain('done');
+    await harness.emit('agent_settled');
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test('refreshes at parent settlement instead of waiting for the poll', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 0 });
+    await harness.emit('agent_start');
+    harness.setSubagents(1);
+    const start = harness.statuses.length;
+    await harness.emit('agent_settled');
+    expect(harness.statuses.slice(start)).not.toContain('done');
+    harness.setSubagents(0);
+    await harness.tick(3_000);
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test('does not apply a snapshot taken before an async launch notice', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 0 });
+    await harness.emit('agent_start');
+    harness.pauseReplies();
+    await harness.tick(3_000);
+    const old = harness.requests.at(-1)!;
+    harness.setSubagents(1);
+    harness.events.emit('subagent:async-started', {});
+    await harness.flush();
+    const before = harness.statuses.length;
+    const settlement = harness.emit('agent_settled');
+    harness.resumeReplies();
+    harness.reply(old, harness.statusReply(old, 0));
+    await settlement;
+    await harness.flush();
+    expect(harness.statuses.slice(before)).not.toContain('done');
+    expect(harness.statuses.at(-1)).toBe('working');
+  });
+
+  test('bounds the entire settlement refresh even when every reply is superseded', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 0 });
+    await harness.emit('agent_start');
+    harness.pauseReplies();
+    let finished = false;
+    const settlement = harness.emit('agent_settled').then(() => { finished = true; });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await harness.tick(750);
+      const request = harness.requests.at(-1)!;
+      harness.events.emit('subagent:async-started', {});
+      harness.reply(request, harness.statusReply(request, 0));
+      await harness.flush();
+      expect(finished).toBe(false);
+    }
+    await harness.tick(500);
+    // Drain lifecycle and command continuations without advancing fake time.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(finished).toBe(true);
+    expect(harness.statuses.at(-1)).toBe('working');
+    await settlement;
+    // Tracking continues after the lifecycle wait expires; only a fresh zero
+    // snapshot may clear the conservative working status.
+    const current = harness.requests.at(-1)!;
+    harness.reply(current, harness.statusReply(current, 0));
+    await harness.flush();
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test.each(['absent', 'legacy'] as const)('stops discovery probes for an %s owner but can discover one later', async (kind) => {
+    const harness = await createHarness();
+    if (kind === 'legacy') {
+      const request = harness.requests.at(-1)!;
+      harness.reply(request, { version: 1, requestId: request.requestId, success: true, data: { text: 'old API' } });
+      await harness.flush();
+    }
+    await harness.tick(60_000);
+    expect(harness.requests.length).toBeLessThanOrEqual(3);
+    const before = harness.requests.length;
+    await harness.tick(60_000);
+    expect(harness.requests.length).toBe(before);
+    expect(harness.statuses).toEqual([]);
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+    expect(harness.statuses.at(-1)).toBe('done');
+    harness.setSubagents(1);
+    harness.events.emit('subagents:rpc:v1:ready', { version: 1 });
+    await harness.flush();
+    expect(harness.statuses.at(-1)).toBe('working');
+    const reports = harness.statuses.length;
+    await harness.tick(3_000);
+    expect(harness.statuses.slice(reports)).toEqual(['working']);
+  });
+
+  test('coalesces heartbeats behind a slow command without delaying the final done with a backlog', async () => {
+    const blocked = deferred();
+    let slow = false;
+    const harness = await createHarness(stoppedMessage(), {
+      subagents: 1,
+      exec: async (args) => {
+        if (slow && args[0] === 'set-window-status' && args[1] === 'working') await blocked.promise;
+        return 0;
+      },
+    });
+    slow = true;
+    const before = harness.statuses.length;
+    await harness.tick(3_000, false);
+    await harness.tick(12_000, false);
+    harness.setSubagents(0);
+    await harness.tick(3_000, false);
+    slow = false;
+    blocked.resolve();
+    await harness.flush();
+    expect(harness.statuses.slice(before)).toEqual(['working', 'done']);
+  });
+
+  test('heartbeats quiet delegated work beyond the sidebar inactivity timeout', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    for (let elapsed = 0; elapsed < 15_000; elapsed += 3_000) {
+      const before = harness.statuses.length;
+      await harness.tick(3_000);
+      expect(harness.statuses.slice(before)).toEqual(['working']);
+    }
+    harness.setSubagents(0);
+    await harness.tick(3_000);
+    const stopped = harness.statuses.length;
+    await harness.tick(6_000);
+    expect(harness.statuses.length).toBe(stopped);
+  });
+
+  test('discovers a late owner and refreshes on async lifecycle hints', async () => {
+    const harness = await createHarness();
+    harness.setSubagents(1);
+    harness.events.emit('subagents:rpc:v1:ready', { version: 1 });
+    await harness.flush();
+    expect(harness.statuses.at(-1)).toBe('working');
+    harness.setSubagents(0);
+    harness.events.emit('subagent:async-complete', { id: 'run' });
+    await harness.flush();
+    expect(harness.statuses.at(-1)).toBe('done');
+    harness.setSubagents(1);
+    harness.events.emit('subagent:async-started', { id: 'new-run' });
+    await harness.flush();
+    expect(harness.statuses.at(-1)).toBe('working');
+  });
+
+  test('combines pi-suba and pi-subagents without either clearing the other', async () => {
+    const harness = await createHarness(stoppedMessage(), { snapshot: 1, subagents: 1 });
+    await harness.activity(0);
+    expect(harness.statuses.at(-1)).toBe('working');
+    await harness.activity(1);
+    harness.setSubagents(0);
+    await harness.tick(3_000);
+    expect(harness.statuses.at(-1)).toBe('working');
+    await harness.activity(0);
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test.each([null, -1, 0.5, '0', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('rejects invalid fleet counts without clearing or heartbeating work (%s)', async (count) => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    harness.pauseReplies();
+    await harness.tick(3_000);
+    const before = harness.statuses.length;
+    const request = harness.requests.at(-1)!;
+    harness.reply(request, harness.statusReply(request, count));
+    await harness.flush();
+    expect(harness.statuses.length).toBe(before);
+  });
+
+  test('ignores failed, incompatible and uncorrelated replies, then recovers', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    harness.pauseReplies();
+    await harness.tick(3_000);
+    const before = harness.statuses.length;
+    const request = harness.requests.at(-1)!;
+    harness.reply(request, { ...harness.statusReply(request, 0), requestId: 'other' });
+    harness.reply(request, { ...harness.statusReply(request, 0), version: 2 });
+    harness.reply(request, { version: 1, requestId: request.requestId, success: false });
+    await harness.flush();
+    await harness.tick(3_000);
+    const next = harness.requests.at(-1)!;
+    harness.reply(next, { ...harness.statusReply(next, 0), data: { fleet: { version: 2, totalActive: 0 } } });
+    await harness.flush();
+    expect(harness.statuses.length).toBe(before);
+    harness.setSubagents(0);
+    harness.resumeReplies();
+    await harness.tick(3_000);
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test('bounds outstanding requests and recovers after timeouts without trusting late replies', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    harness.pauseReplies();
+    await harness.tick(3_000);
+    const request = harness.requests.at(-1)!;
+    const before = harness.requests.length;
+    for (let i = 0; i < 5; i++) harness.events.emit('subagent:async-started', {});
+    await harness.flush();
+    expect(harness.requests.length).toBe(before);
+    await harness.tick(2_000);
+    const statuses = harness.statuses.length;
+    harness.reply(request, harness.statusReply(request, 0));
+    await harness.flush();
+    expect(harness.statuses.length).toBe(statuses);
+    harness.setSubagents(0);
+    harness.resumeReplies();
+    await harness.tick(1_000);
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test('shutdown cancels outstanding RPC, removes listeners and stops polling', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    harness.pauseReplies();
+    await harness.tick(3_000);
+    const request = harness.requests.at(-1)!;
+    await harness.emit('session_shutdown');
+    const before = harness.statuses.length;
+    const requests = harness.requests.length;
+    harness.reply(request, harness.statusReply(request, 2));
+    harness.events.emit('subagent:async-started', {});
+    await harness.tick(9_000);
+    expect(harness.statuses.length).toBe(before);
+    expect(harness.statuses.at(-1)).toBe('done');
+    expect(harness.requests.length).toBe(requests);
+    expect(harness.listeners.get(`subagents:rpc:v1:reply:${request.requestId}`)?.size ?? 0).toBe(0);
+  });
+
+  test('shutdown cannot be undone by a settlement waiting for RPC', async () => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    harness.pauseReplies();
+    const settlement = harness.emit('agent_settled');
+    await harness.emit('session_shutdown');
+    await settlement;
+    await harness.flush();
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test.each([false, true])('session replacement discards previous activity and uncertainty (%s)', async (uncertain) => {
+    const harness = await createHarness(stoppedMessage(), { subagents: 1 });
+    harness.pauseReplies();
+    if (uncertain) {
+      const settlement = harness.emit('agent_settled');
+      await harness.tick(2_000);
+      await settlement;
+    }
+    await harness.tick(3_000);
+    const old = harness.requests.at(-1)!;
+    harness.setSubagents(0);
+    harness.resumeReplies();
+    await harness.emit('session_start');
+    await harness.flush();
+    const before = harness.statuses.length;
+    harness.reply(old, harness.statusReply(old, 2));
+    await harness.flush();
+    expect(harness.statuses.length).toBe(before);
+    expect(harness.statuses.at(-1)).toBe('done');
+  });
+
+  test.each(['child', 'disabled'] as const)('does not register or publish from a %s runtime', async (flag) => {
+    const harness = await createHarness(stoppedMessage(), { [flag]: true, subagents: 1 });
+    await harness.emit('agent_start');
+    await harness.emit('agent_settled');
+    await harness.tick(6_000);
+    await harness.emit('session_shutdown');
+    expect(harness.calls).toEqual([]);
+    expect(harness.requests).toEqual([]);
+  });
+});
 
 describe('pi workmux status extension', () => {
   test('registers without changing status when no publisher is present', async () => {
